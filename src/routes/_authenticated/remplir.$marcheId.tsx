@@ -63,6 +63,7 @@ function Remplir() {
   const [bulkOpen, setBulkOpen] = useState(false);
   const [matching, setMatching] = useState(false);
   const [poseFocusTick, setPoseFocusTick] = useState(0);
+  const [chapProgress, setChapProgress] = useState<{ id: string; code: string; titre: string | null; status: "pending" | "loading" | "done" | "error" }[] | null>(null);
   const [addArtChap, setAddArtChap] = useState<{ id: string; code: string } | null>(null);
   const [artForm, setArtForm] = useState({ designation: "", unite: "U", quantite: "1" });
   const parentRef = useRef<HTMLDivElement>(null);
@@ -160,14 +161,55 @@ function Remplir() {
     qc.invalidateQueries({ queryKey: key });
   }
 
+  // Drives one logical scope (a chapter, or an explicit set of ligneIds) to completion,
+  // making as many round-trips as the server's CPU-time budget forces — each call processes
+  // only what fits in ~7ms of actual scoring work, returning a cursor to resume from.
+  // Results are flushed to the UI after every chunk, not just at the end, so progress is visible live.
+  async function runChunked(extra: Record<string, unknown>) {
+    let cursor = 0, totalDone = 0, totalFail = 0;
+    for (;;) {
+      const r = await runMatch({ data: { marcheId, cursor, useAi: true, ...extra } });
+      totalDone += r.done; totalFail += r.failures;
+      qc.invalidateQueries({ queryKey: key });
+      if (r.nextCursor == null) return { done: totalDone, failures: totalFail };
+      cursor = r.nextCursor;
+    }
+  }
+
   async function launchMatch(onlyCurrent = false) {
     setMatching(true);
-    const t = toast.loading(onlyCurrent ? "Matching de la ligne…" : "Matching IA en cours…");
-    try {
-      const r = await runMatch({ data: { marcheId, ligneIds: onlyCurrent && current ? [current.id] : undefined, useAi: true } });
-      toast.success(`${r.done} lignes analysées${r.failures ? ` · ${r.failures} replis déterministes` : ""}`, { id: t });
-      qc.invalidateQueries({ queryKey: key });
-    } catch (e: any) { toast.error(e.message, { id: t }); } finally { setMatching(false); }
+    if (onlyCurrent && current) {
+      const t = toast.loading("Matching de la ligne…");
+      try {
+        const r = await runChunked({ ligneIds: [current.id] });
+        toast.success(`Ligne analysée${r.failures ? " · repli déterministe" : ""}`, { id: t });
+      } catch (e: any) { toast.error(e.message, { id: t }); } finally { setMatching(false); }
+      return;
+    }
+    // Full marché: one chapter at a time, so a huge bordereau can never blow a single
+    // request's CPU budget — and the person sees each chapter complete as it finishes
+    // instead of staring at a blank spinner until the entire thing is done.
+    const orphanIds = allLignes.filter((l) => !chapitres.some((c: any) => c.id === l.chapitre_id) && l.statut !== "verifie").map((l) => l.id);
+    const scopes = [...chapitres.map((c: any) => ({ id: c.id, code: c.code, titre: c.titre })), ...(orphanIds.length ? [{ id: null, code: "—", titre: "Hors chapitre" }] : [])];
+    setChapProgress(scopes.map((s) => ({ ...s, status: "pending" as const })));
+    let done = 0, failures = 0;
+    for (const s of scopes) {
+      const hasWork = s.id === null || allLignes.some((l) => l.chapitre_id === s.id && l.statut !== "verifie");
+      if (!hasWork) { setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "done" } : x))); continue; }
+      setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "loading" } : x)));
+      try {
+        const r = await runChunked(s.id ? { chapitreId: s.id } : { ligneIds: orphanIds });
+        done += r.done; failures += r.failures;
+        setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "done" } : x)));
+      } catch (e: any) {
+        toast.error(`${s.code} : ${e.message}`);
+        setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "error" } : x)));
+      }
+    }
+    toast.success(`${done} lignes analysées${failures ? ` · ${failures} replis déterministes` : ""}`);
+    await logActivity(supabase, user.id, "match_ia_marche", "marches", marcheId, { done, failures });
+    setTimeout(() => setChapProgress(null), 1200);
+    setMatching(false);
   }
 
   async function addArticle() {
@@ -193,7 +235,7 @@ function Remplir() {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || searchOpen || bulkOpen || addArtChap) return;
+      if (tag === "INPUT" || tag === "TEXTAREA" || searchOpen || bulkOpen || addArtChap || matching) return;
       if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); setSel((s) => Math.min(s + 1, ordered.length - 1)); }
       else if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); setSel((s) => Math.max(s - 1, 0)); }
       else if (e.key === "Enter" && current) { e.preventDefault(); accept(current); }
@@ -208,7 +250,7 @@ function Remplir() {
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [ordered.length, current, accept, reject, searchOpen, bulkOpen, addArtChap]);
+  }, [ordered.length, current, accept, reject, searchOpen, bulkOpen, addArtChap, matching]);
 
   if (!m) return <div className="p-6 text-sm text-muted-foreground">Chargement…</div>;
   const counts = { non_rempli: 0, suggestion_ia: 0, verifie: 0 } as Record<string, number>;
@@ -216,7 +258,7 @@ function Remplir() {
   const chapById = Object.fromEntries(totals.chapitres.map((c) => [c.id, c]));
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="relative flex h-screen flex-col">
       {/* Header: running totals */}
       <div className="flex h-12 shrink-0 items-center gap-4 border-b bg-card px-3">
         <Link to="/chantiers/$chantierId" params={{ chantierId: m.chantier_id }} className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"><ChevronLeft className="size-3.5" />{m.chantiers?.nom}</Link>
@@ -329,6 +371,28 @@ function Remplir() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {matching && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-[1px] cursor-wait">
+          <div className="w-80 rounded-lg border bg-card p-4 shadow-lg">
+            <div className="mb-2 flex items-center gap-2 text-sm font-semibold"><Loader2 className="size-4 animate-spin" />Matching IA en cours</div>
+            {chapProgress ? (
+              <div className="max-h-72 space-y-1 overflow-auto text-xs">
+                {chapProgress.map((c) => (
+                  <div key={c.id ?? "orphans"} className="flex items-center gap-2">
+                    {c.status === "done" && <span className="w-3.5 text-ok">✓</span>}
+                    {c.status === "error" && <span className="w-3.5 text-destructive">✕</span>}
+                    {c.status === "loading" && <Loader2 className="size-3.5 w-3.5 animate-spin text-muted-foreground" />}
+                    {c.status === "pending" && <span className="w-3.5 text-muted-foreground">○</span>}
+                    <span className={cn("truncate", c.status === "loading" ? "font-medium" : "text-muted-foreground")}>{c.code} — {c.titre || "Sans titre"}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-xs text-muted-foreground">Analyse de la ligne…</p>}
+            <p className="mt-3 text-[11px] text-muted-foreground">Traité par petits blocs (limite d'hébergement) — chapitre par chapitre. Ne fermez pas cette page.</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

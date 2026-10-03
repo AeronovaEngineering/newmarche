@@ -1,5 +1,5 @@
 // @ts-nocheck — strict index-signature typing relaxed; runtime-validated
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -114,7 +114,7 @@ function Produit() {
           <thead className="text-left text-[11px] uppercase tracking-wider text-muted-foreground"><tr className="border-b"><th className="px-3 py-2 font-medium">Fournisseur</th><th className="font-medium">Réf.</th><th className="text-right font-medium">Prix (DT)</th><th className="text-right font-medium">Délai</th><th className="text-right font-medium">MOQ</th><th className="font-medium pl-4">Dispo</th><th className="text-right font-medium">MAJ</th><th className="px-3 font-medium">Historique</th><th className="w-10" /></tr></thead>
           <tbody>{offres.map((o: any, i: number) => (
             <tr key={o.id} className={`border-b last:border-0 ${i === 0 ? "bg-ok-soft" : ""}`}>
-              <td className="px-3 py-2"><Link to="/fournisseurs/$fournisseurId" params={{ fournisseurId: o.fournisseur_id }} className="hover:underline">{o.fournisseurs?.nom}</Link> <span className="text-muted-foreground">{"★".repeat(o.fournisseurs?.note_fiabilite ?? 0)}</span></td>
+              <td className="px-3 py-2">{o.fournisseurs?.nom} <span className="text-muted-foreground">{"★".repeat(o.fournisseurs?.note_fiabilite ?? 0)}</span></td>
               <td className="num text-xs">{o.reference_fournisseur}</td>
               <td className="num text-right font-semibold">
                 {canEdit ? <input defaultValue={Number(o.prix_fourniture)} type="number" step="0.001" className="w-20 bg-transparent text-right outline-none focus:underline" onBlur={(e) => Number(e.target.value) !== Number(o.prix_fourniture) && updateOffer(o.id, { prix_fourniture: Number(e.target.value) || 0, date_maj: new Date().toISOString() })} /> : fmtDT(Number(o.prix_fourniture))}
