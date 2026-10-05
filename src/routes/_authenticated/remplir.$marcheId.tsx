@@ -19,7 +19,7 @@ import { matchLignes } from "@/lib/match.functions";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/_authenticated/remplir/$marcheId")({
+export const Route = createFileRoute("/_authenticated/remplir/marcheId")({
   head: () => ({ meta: [{ title: "Remplir — AeroNova BID" }, { name: "description", content: "Poste de revue des suggestions de prix ligne par ligne." }, { property: "og:title", content: "Remplir — AeroNova BID" }, { property: "og:description", content: "Poste de revue des suggestions de prix ligne par ligne." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }),
   component: Remplir,
 });
@@ -28,9 +28,6 @@ type Offre = { id: string; fournisseur_nom: string; prix_fourniture: number; del
 type Cand = { produit_id: string; designation: string; score: number; text: number; spec: number; unit: number; notes: string[]; offres: Offre[]; labels: { cheapest: string | null; fastest: string | null; usual: string | null } };
 type Bid = { fournisseur_produit_id: string | null; prix_achat: number | null; marge_pct: number | null; prix_unitaire: number | null; prix_pose: number | null; confiance: string | null; justification: string | null; candidats: Cand[]; source: string };
 type Ligne = { id: string; numero: string | null; designation: string; unite: string | null; quantite: number; statut: "non_rempli" | "suggestion_ia" | "verifie"; chapitre_id: string | null; ordre: number; bid_lignes: Bid | null };
-
-/** Ligne « PM » (pour mémoire) : importée à quantité 0 par le parseur de bordereau (ou unité écrite PM). */
-const isPM = (l: Ligne) => Number(l.quantite) === 0 || /^p\.?\s?m\.?$/i.test((l.unite ?? "").trim());
 
 function useMarche(id: string) {
   return useQuery({
@@ -171,7 +168,11 @@ function Remplir() {
   async function runChunked(extra: Record<string, unknown>) {
     let cursor = 0, totalDone = 0, totalFail = 0;
     for (;;) {
-      const r = await runMatch({ data: { marcheId, cursor, useAi: true, ...extra } });
+      let r;
+      for (let attempt = 0; ; attempt++) {
+        try { r = await runMatch({ data: { marcheId, cursor, useAi: true, ...extra } }); break; }
+        catch (e) { if (attempt >= 2) throw e; await new Promise((res) => setTimeout(res, 800 * (attempt + 1))); } // transient Worker limit hit: pause, then resume from same cursor
+      }
       totalDone += r.done; totalFail += r.failures;
       qc.invalidateQueries({ queryKey: key });
       if (r.nextCursor == null) return { done: totalDone, failures: totalFail };
@@ -303,8 +304,8 @@ function Remplir() {
                 }
                 const l = it.l; const b = l.bid_lignes; const active = it.idx === sel;
                 return (
-                  <div key={vi.key} style={style} onClick={() => setSel(it.idx)} title={isPM(l) ? "PM — pour mémoire (quantité 0)" : undefined}
-                    className={cn("grid cursor-default grid-cols-[14px_48px_1fr_56px_36px_84px_76px_88px_100px] items-center gap-2 border-b px-3 text-[13px]", active ? "bg-accent ring-1 ring-inset ring-ring" : "hover:bg-muted/40", l.statut === "suggestion_ia" && !active && "bg-attention-soft/40", isPM(l) && !active && "bg-red-500/15 hover:bg-red-500/25")}>
+                  <div key={vi.key} style={style} onClick={() => setSel(it.idx)}
+                    className={cn("grid cursor-default grid-cols-[14px_48px_1fr_56px_36px_84px_76px_88px_100px] items-center gap-2 border-b px-3 text-[13px]", active ? "bg-accent ring-1 ring-inset ring-ring" : "hover:bg-muted/40", l.statut === "suggestion_ia" && !active && "bg-attention-soft/40")}>
                     <Dot className={STATUT_LIGNE[l.statut].dot} />
                     <span className="num truncate text-xs text-muted-foreground">{l.numero ?? "N/A"}</span>
                     <span className="line-clamp-2 leading-tight">{l.designation}</span>

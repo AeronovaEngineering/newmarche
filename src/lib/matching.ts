@@ -13,21 +13,36 @@ export function normalize(s: string): string {
   return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/ø|⌀/g, " d").replace(/[^a-z0-9.,/ ]/g, " ").replace(/\s+/g, " ").trim();
 }
+const TOKEN_CACHE = new Map<string, string[]>();
 export function tokens(s: string): string[] {
-  return normalize(s).split(" ").filter((t) => t.length > 1 && !STOP.has(t));
+  // Memoized: the same catalogue strings are re-tokenized for every line otherwise (NFD + regex = costly on Workers' 10ms CPU cap).
+  let t = TOKEN_CACHE.get(s);
+  if (!t) {
+    t = normalize(s).split(" ").filter((x) => x.length > 1 && !STOP.has(x));
+    if (TOKEN_CACHE.size > 5000) TOKEN_CACHE.clear();
+    TOKEN_CACHE.set(s, t);
+  }
+  return t;
 }
 
+// Reusable rows: avoids allocating two arrays per character of `a`.
+let ROW_A = new Uint16Array(256), ROW_B = new Uint16Array(256);
 export function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
+  if (a.length < b.length) { const t = a; a = b; b = t; } // distance is symmetric; keep the row on the shorter string
   const m = a.length, n = b.length;
-  if (!m) return n; if (!n) return m;
-  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  if (!n) return m;
+  if (n + 1 > ROW_A.length) { ROW_A = new Uint16Array(n + 1); ROW_B = new Uint16Array(n + 1); }
+  let prev = ROW_A, cur = ROW_B;
+  for (let j = 0; j <= n; j++) prev[j] = j;
   for (let i = 1; i <= m; i++) {
-    const cur = [i];
+    cur[0] = i;
+    const ai = a.charCodeAt(i - 1);
     for (let j = 1; j <= n; j++) {
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      const del = prev[j] + 1, ins = cur[j - 1] + 1, sub = prev[j - 1] + (ai === b.charCodeAt(j - 1) ? 0 : 1);
+      cur[j] = del < ins ? (del < sub ? del : sub) : (ins < sub ? ins : sub);
     }
-    prev = cur;
+    const t = prev; prev = cur; cur = t;
   }
   return prev[n];
 }
@@ -106,16 +121,56 @@ export interface ScoredCandidate {
   notes: string[]; offres: Offre[];
 }
 
+/** Upper bound of ratio(a,b) from lengths alone (Levenshtein >= |len diff|). O(1). */
+function ratioUB(a: string, b: string): number {
+  if (!a && !b) return 1;
+  return 1 - Math.abs(a.length - b.length) / Math.max(a.length, b.length);
+}
+/** tokenSetRatio with the three strings built once; `exact=false` returns only a cheap upper bound. */
+function tokenSetParts(A: string[], B: string[]) {
+  const SB = new Set(B), SA = new Set(A);
+  const inter = A.filter((t) => SB.has(t)).sort();
+  const dA = A.filter((t) => !SB.has(t)).sort();
+  const dB = B.filter((t) => !SA.has(t)).sort();
+  const i = inter.join(" ");
+  return { i, s1: [i, ...dA].join(" ").trim(), s2: [i, ...dB].join(" ").trim() };
+}
+
 export function scoreCandidates(line: { designation: string; unite?: string | null }, produits: ProduitCand[], topN = 5): ScoredCandidate[] {
   const ls = parseSpecs(line.designation);
   const lu = normUnit(line.unite);
-  return produits.map((p) => {
-    const text = tokenSetRatio(line.designation, `${p.designation} ${p.category_nom ?? ""}`);
+  const lineTokens = [...new Set(tokens(line.designation))];
+
+  // Pass 1 (cheap): spec/unit scores + a length-based upper bound on the text ratio.
+  // Pass 2: exact Levenshtein only for products that can still reach the top N.
+  // Results are identical to scoring everything — pruned products provably score below the N-th best.
+  const pre = [];
+  produits.forEach((p, idx) => {
+    if (!(p.offres.length > 0)) return;
     const { score: spec, notes } = specScore(ls, p.specs ?? {});
     const unit = !lu ? 0.5 : normUnit(p.unite_reference) === lu ? 1 : 0;
-    const score = 0.55 * text + 0.35 * spec + 0.1 * unit;
-    return { produit_id: p.id, designation: p.designation, score: Math.round(score * 1000) / 1000, text, spec, unit, notes, offres: p.offres };
-  }).filter((c) => c.offres.length > 0).sort((a, b) => b.score - a.score).slice(0, topN);
+    const parts = tokenSetParts(lineTokens, [...new Set(tokens(`${p.designation} ${p.category_nom ?? ""}`))]);
+    const ub = Math.max(ratioUB(parts.i, parts.s1), ratioUB(parts.i, parts.s2), ratioUB(parts.s1, parts.s2));
+    pre.push({ p, idx, spec, notes, unit, parts, max: 0.55 * ub + 0.35 * spec + 0.1 * unit });
+  });
+  pre.sort((x, y) => y.max - x.max);
+
+  const out: (ScoredCandidate & { idx: number })[] = [];
+  let kth = -Infinity; // N-th best exact score so far
+  for (const c of pre) {
+    if (out.length >= topN && c.max < kth - 0.001) break; // sorted by bound: nothing after can qualify
+    const { i, s1, s2 } = c.parts;
+    const text = Math.max(ratio(i, s1), ratio(i, s2), ratio(s1, s2));
+    const score = Math.round((0.55 * text + 0.35 * c.spec + 0.1 * c.unit) * 1000) / 1000;
+    out.push({ produit_id: c.p.id, designation: c.p.designation, score, text, spec: c.spec, unit: c.unit, notes: c.notes, offres: c.p.offres, idx: c.idx });
+    if (out.length >= topN) {
+      out.sort((a, b) => b.score - a.score || a.idx - b.idx);
+      out.length = topN;
+      kth = out[topN - 1].score;
+    }
+  }
+  out.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  return out.slice(0, topN).map(({ idx, ...r }) => r);
 }
 
 /** Pick the "cheapest", "fastest", and "usual" (most reliable supplier) offerings. */
