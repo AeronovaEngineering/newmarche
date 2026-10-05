@@ -6,17 +6,21 @@ import { confidenceFromScore, offerLabels, scoreCandidates, type ProduitCand, ty
 
 const GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
-// Cloudflare Workers (free tier) caps a single request at 10ms of CPU time —
-// wall-clock time spent AWAITING the AI call or the database does not count
-// against this, only synchronous JS execution does. The one CPU-heavy part
-// here is scoreCandidates(), which compares a line against the whole
-// catalogue. We clock only that synchronous work with performance.now(), and
-// stop well under the real cap (leaving headroom for engine/runtime overhead
-// this measurement can't see), returning however many lines got done plus a
-// cursor so the caller can resume. At least one line is always processed per
-// call, even if that single line alone blows the budget, so a pathologically
-// large catalogue can't produce a chunk that makes zero progress.
+// Cloudflare Workers (free tier) enforces TWO independent caps per request:
+//  - 10ms of CPU time (wall-clock spent AWAITING the AI call or the database
+//    does NOT count — only synchronous JS execution does)
+//  - 50 outgoing subrequests (every fetch() counts as one — including every
+//    Supabase REST call AND every AI gateway call)
+// The deterministic scoring loop can blow the CPU budget on a big catalogue;
+// the per-line AI call + per-line DB writes can independently blow the
+// subrequest budget on a big marché even when scoring is cheap — that second
+// limit is why "most chapters returned nothing": at ~3 subrequests/line
+// (1 AI call + 2 writes), the Worker hit 50 around line 16 on every chunk,
+// every time, regardless of CPU time left.
+// Fix: batch the per-line DB writes into two bulk calls per chunk (instead of
+// two calls PER LINE), and stop the loop on whichever budget is hit first.
 const CPU_BUDGET_MS = 7;
+const SUBREQUEST_BUDGET = 40; // cap the loop itself at 40, leaving headroom under 50 for the 2 setup queries + the 2 bulk writes after the loop
 
 async function llmPick(line: { designation: string; unite: string | null; quantite: number }, cands: ScoredCandidate[], key: string) {
   const list = cands.map((c, i) => ({
@@ -60,7 +64,7 @@ export const matchLignes = createServerFn({ method: "POST" })
     const { data: canEdit } = await sb.rpc("has_perm", { _user_id: context.userId, _perm: "bids_write" });
     if (!canEdit) throw new Error("Droits insuffisants");
 
-    const { data: marche } = await sb.from("marches").select("id, chantiers(marge_defaut_pct)").eq("id", data.marcheId).single();
+    const { data: marche } = await sb.from("marches").select("id, chantiers(marge_defaut_pct)").eq("id", data.marcheId).single(); // subrequest #1
     const marge = Number((marche as any)?.chantiers?.marge_defaut_pct ?? 20);
 
     let q = sb.from("marche_lignes").select("id, designation, unite, quantite, statut").eq("marche_id", data.marcheId).order("ordre");
@@ -69,11 +73,11 @@ export const matchLignes = createServerFn({ method: "POST" })
       q = q.neq("statut", "verifie");
       if (data.chapitreId) q = q.eq("chapitre_id", data.chapitreId);
     }
-    const { data: allLignes, error: le } = await q;
+    const { data: allLignes, error: le } = await q; // subrequest #2
     if (le) throw new Error(le.message);
     const total = allLignes?.length ?? 0;
 
-    const { data: prods, error: pe } = await sb.from("produits")
+    const { data: prods, error: pe } = await sb.from("produits") // subrequest #3
       .select("id, designation, unite_reference, specs, categories(nom), fournisseur_produits(id, produit_id, fournisseur_id, prix_fourniture, delai_livraison_jours, date_maj, disponibilite, fournisseurs(nom, note_fiabilite, actif))");
     if (pe) throw new Error(pe.message);
     const t0cat = performance.now();
@@ -85,9 +89,12 @@ export const matchLignes = createServerFn({ method: "POST" })
       })),
     }));
     let cpuUsed = performance.now() - t0cat; // mapping the catalogue is itself synchronous CPU work, charged once per chunk
+    let subreqs = 3; // the three queries above
 
     const key = process.env["LOVABLE_API_KEY"];
-    let done = 0, failures = 0, i = data.cursor;
+    let failures = 0, i = data.cursor;
+    const bidUpserts: any[] = [];
+    const statutUpdates: { id: string; statut: string }[] = [];
     for (; i < total; i++) {
       const l = allLignes![i];
       const tScore = performance.now();
@@ -100,9 +107,10 @@ export const matchLignes = createServerFn({ method: "POST" })
       let offreId: string | undefined;
       if (data.useAi && key && cands.length) {
         try {
-          const pick = await llmPick({ designation: l.designation, unite: l.unite, quantite: Number(l.quantite) }, cands, key); // awaited I/O — not charged to cpuUsed
+          const pick = await llmPick({ designation: l.designation, unite: l.unite, quantite: Number(l.quantite) }, cands, key); // 1 subrequest, awaited I/O not charged to cpuUsed
+          subreqs++;
           chosenIdx = pick.idx; conf = pick.confiance; just = pick.justification; offreId = pick.offre_id;
-        } catch (e) { failures++; console.error(e); }
+        } catch (e) { subreqs++; failures++; console.error(e); }
       }
 
       const tPost = performance.now();
@@ -114,9 +122,9 @@ export const matchLignes = createServerFn({ method: "POST" })
       }));
       const offre = top ? (top.offres.find((o) => o.id === offreId) ?? [...top.offres].sort((a, b) => a.prix_fourniture - b.prix_fourniture)[0]) : undefined;
       const prixAchat = offre?.prix_fourniture ?? null;
-      cpuUsed += performance.now() - tPost;
 
-      await sb.from("bid_lignes").upsert({
+      // Queued, not written yet — this is what cuts subrequests from 2×N lines to 2 total per chunk.
+      bidUpserts.push({
         marche_ligne_id: l.id,
         fournisseur_produit_id: offre?.id ?? null,
         prix_achat: prixAchat,
@@ -128,13 +136,20 @@ export const matchLignes = createServerFn({ method: "POST" })
         candidats,
         verified_by: null, verified_at: null,
         updated_at: new Date().toISOString(),
-      }, { onConflict: "marche_ligne_id" });
-      await sb.from("marche_lignes").update({ statut: offre ? "suggestion_ia" : "non_rempli" }).eq("id", l.id);
-      done++;
+      });
+      statutUpdates.push({ id: l.id, statut: offre ? "suggestion_ia" : "non_rempli" });
+      cpuUsed += performance.now() - tPost;
 
-      if (cpuUsed >= CPU_BUDGET_MS) { i++; break; } // always at least this one line, even if it alone exceeded budget
+      if (cpuUsed >= CPU_BUDGET_MS || subreqs >= SUBREQUEST_BUDGET) { i++; break; } // always at least this one line, even if it alone exceeded a budget
+    }
+
+    if (bidUpserts.length) {
+      await sb.from("bid_lignes").upsert(bidUpserts, { onConflict: "marche_ligne_id" }); // 1 subrequest regardless of how many lines were queued
+      // Partial-column upsert: PostgREST only touches the columns present in each row (id + statut here),
+      // so this is a safe bulk "update statut for many ids", not a destructive overwrite of the rest of the row.
+      await sb.from("marche_lignes").upsert(statutUpdates, { onConflict: "id" }); // 1 subrequest
     }
     const nextCursor = i < total ? i : null;
-    await sb.from("activity_log").insert({ user_id: context.userId, action: "match_ia_chunk", entity: "marches", entity_id: data.marcheId, details: { done, failures, cursor: data.cursor, nextCursor, chapitreId: data.chapitreId ?? null } });
-    return { done, failures, total, nextCursor };
+    await sb.from("activity_log").insert({ user_id: context.userId, action: "match_ia_chunk", entity: "marches", entity_id: data.marcheId, details: { done: bidUpserts.length, failures, cursor: data.cursor, nextCursor, chapitreId: data.chapitreId ?? null } });
+    return { done: bidUpserts.length, failures, total, nextCursor };
   });

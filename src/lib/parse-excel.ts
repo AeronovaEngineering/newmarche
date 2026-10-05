@@ -19,7 +19,7 @@ function pickBestSheet(sheets: { name: string; rows: Row[] }[]): Row[] {
   return list[0].rows;
 }
 
-const norm = (v: unknown) => String(v ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+const norm = (v: unknown) => String(v ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
 export const toNum = (v: unknown): number | null => {
   if (v == null || v === "") return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -62,7 +62,7 @@ const HEADER_MATCHERS: [string, RegExp][] = [
   ["total", /total|montant/],
   ["des", /designation|libelle|description|ouvrage|intitule|nature des|travaux/],
   ["qte", /^(q|qte|qt|quantite|quantites|quant|nbre|nombre)(\b|\s|\.|$)/],
-  ["unite", /^(u|un|unite|unit)\.?$|^unite/],
+  ["unite", /^(u|un|unite|unit)\.?$|^unite|^uni\s*-?\s*te$/],
   ["num", /^(n[°o]?|no|num|numero|art|article|code|item|ref)(\b|\s|\.|$)/],
   ["pose", POSE_RE],
   ["prix", /^(prix|pu|p\.u|tarif)/],
@@ -74,7 +74,7 @@ function detectHeader(row: Row): ColMap | null {
   const used = new Set<number>();
   row.forEach((c, i) => {
     const t = norm(c);
-    if (!t || t.length > 40) return;
+    if (!t || t.length > 80) return;
     for (const [k, re] of HEADER_MATCHERS) {
       if (map[k] == null && re.test(t) && !used.has(i)) { map[k] = i; used.add(i); break; }
     }
@@ -113,6 +113,14 @@ function stripLeaders(s: string): string {
   return t;
 }
 
+/** « PM » = pour mémoire (quantité non chiffrée) : importé en quantité 0, jamais ignoré. */
+const PM_RE = /^\(?\s*(p\s*\.?\s*m\.?|pour\s+memoire|memoire)\s*\)?$/;
+const isPM = (v: unknown) => PM_RE.test(norm(v));
+/** « CHAPITRE 3 : HVAC CTA 3 » — vrai chapitre ; les I / 1 / 2 / « 1 - EQUIPEMENTS » deviennent alors des sous-parties. */
+const TOP_CHAPTER_RE = /^chapitre\s+(\d+)\s*[:\-–.)]*\s*(.*)$/i;
+const RECAP_RE = /^recapitulation\s+generale/;
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const ROMAN_RE = /^[IVXLCDM]{1,7}$/;
 const ITEM_CODE_RE = /^(\d+(\.\d+)+|\d+[.\-)]|[A-Z]{1,2}[.\-]\d+(\.\d+)*)\.?$/;
 const INT_RE = /^\d+$/;
@@ -125,7 +133,7 @@ const NOTE_RE = /^(n\.?\s*b\.?\s*:|nota\b|remarque)/i;
 
 const isCode = (s: string) => ROMAN_RE.test(s) || /^[A-Z]$/.test(s) || ITEM_CODE_RE.test(s) || INT_RE.test(s);
 
-interface Art { num: string; parts: string[]; label: string; emitted: number; unit: string; compUnit: string; comp: boolean; zone: string }
+interface Art { num: string; parts: string[]; label: string; emitted: number; unit: string; compUnit: string; comp: boolean; zone: string; pend: { qty: number; unit: string } | null }
 
 /** Bordereau des prix : détecte N° / Désignation / Unité / Quantité, chapitres, articles, variantes a) b) c), lignes « Fourniture / Pose ». */
 export function parseBordereau(rows: Row[]): ParsedChapitre[] {
@@ -141,14 +149,20 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
 
   const body = rows.slice(start);
   // Entiers « 1 », « 2 » = chapitres seulement si des articles « 1.x » existent
-  const nums = new Set(body.map((r) => (map!.num != null ? clean(r[map!.num]) : "")).filter(Boolean));
+  const numOf = (v: unknown) => { const t = clean(v); return /^\d+,\d+$/.test(t) ? t.replace(",", ".") : t; };   // « 3,1 » → « 3.1 »
+  const nums = new Set(body.map((r) => (map!.num != null ? numOf(r[map!.num]) : "")).filter(Boolean));
   const hasChildren = (n: string) => [...nums].some((x) => x.startsWith(n + "."));
+
+  // Le bordereau déclare-t-il de vrais « CHAPITRE n : … » (souvent dans la colonne N°) ?
+  const hasTop = body.some((r) => (map!.num != null && TOP_CHAPTER_RE.test(numOf(r[map!.num]))) || TOP_CHAPTER_RE.test(clean(r[map!.des])));
 
   const chapitres: ParsedChapitre[] = [];
   let chap: ParsedChapitre | null = null;
   let art: Art | null = null;
   let zone = "";
   let prevUnit = "";
+  let intro = "";        // texte descriptif d'un chapitre numéroté (« 2 VOLETS… » + description) repris devant ses variantes (2.1, 2.2…)
+  let chapInt = false;   // le chapitre courant est un chapitre « entier » (1, 2, 3…) : un entier sans sous-articles = chapitre frère
 
   const ensureChap = () => { if (!chap) { chap = { code: "1", titre: "Général", lignes: [] }; chapitres.push(chap); } return chap; };
   const join = (a: string[]) => a.filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
@@ -157,11 +171,11 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
   function emit(a: Art | null, text: string, unit: string, qty: number) {
     const base = a ? join(a.parts) : "";
     const label = a ? join([a.label, text]) : text;
-    const designation = [base, label].filter(Boolean).join(" — ").replace(/\s+/g, " ").trim();
+    const designation = [intro, base, label].filter(Boolean).join(" — ").replace(/\s+/g, " ").trim();
     if (!designation) return;
     const u = unit || a?.unit || a?.compUnit || prevUnit || "";
     if (u) prevUnit = u;
-    if (a) { a.emitted++; a.label = ""; if (unit) a.unit = unit; }
+    if (a) { a.emitted++; a.label = ""; a.pend = null; if (unit) a.unit = unit; }
     ensureChap().lignes.push({ numero: a?.num ?? "", designation, quantite: qty, unite: u, zone: a?.zone ?? zone });
   }
 
@@ -169,7 +183,9 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
   function flush() {
     const a = art; art = null;
     if (!a) return;
-    if (a.emitted === 0 && (a.comp || a.unit) && a.parts.length) emit(a, "", a.unit, 0);
+    // lignes « Fourniture / Pose » chiffrées sans ligne de total (« L'unité », « L'ensemble »…) : on garde leur quantité
+    if (a.emitted === 0 && a.pend) emit(a, "", a.pend.unit || a.unit || a.compUnit, a.pend.qty);
+    else if (a.emitted === 0 && (a.comp || a.unit) && a.parts.length) emit(a, "", a.unit, 0);
   }
 
   for (const row of body) {
@@ -177,14 +193,29 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
     const h = detectHeader(row);
     if (h) { map = h; continue; }
 
-    const num = map.num != null ? clean(row[map.num]) : "";
+    const num = map.num != null ? numOf(row[map.num]) : "";
     const desRaw = clean(row[map.des]);
-    const unite = map.unite != null ? clean(row[map.unite]) : "";
-    const qte = toNum(row[map.qte]);
+    let unite = map.unite != null ? clean(row[map.unite]) : "";
+    // PM (dans la colonne Quantité ou Unité) → ligne importée à quantité 0, à repérer dans « Remplir »
+    const pm = isPM(row[map.qte]) || (map.unite != null && isPM(row[map.unite]));
+    if (pm && isPM(unite)) unite = "";
+    const qte = pm ? 0 : toNum(row[map.qte]);
     const des = stripLeaders(desRaw);
     const lower = norm(desRaw);
 
+    if (RECAP_RE.test(lower) || RECAP_RE.test(norm(num))) break;   // « RECAPITULATION GENERALE » : plus aucun article après
     if (!num && !desRaw && qte == null) continue;
+    // sous-total de fin de partie (« RESEAUX AERAULIQUES ………… » en majuscules + points) : ni ligne ni sous-titre
+    const noDots = desRaw.replace(/[.…_·]{3,}/g, "").trim();
+    if (qte == null && !num && noDots && noDots !== desRaw.trim() && noDots === noDots.toUpperCase() && /[A-Z]{3}/.test(noDots)) continue;
+    // vrai chapitre « CHAPITRE n : titre »
+    const top = hasTop && qte == null ? (num.match(TOP_CHAPTER_RE) ?? desRaw.match(TOP_CHAPTER_RE)) : null;
+    if (top) {
+      flush();
+      chap = { code: top[1], titre: top[2].replace(/\s+/g, " ").trim(), lignes: [] }; chapitres.push(chap); zone = ""; prevUnit = "";
+      continue;
+    }
+    if (pm && !num && !desRaw) continue;
     if (TOTAL_RE.test(lower) && qte == null) continue;      // ne ferme PAS l'article : un S/TOTAL tombe souvent au milieu d'un article (saut de page)
     if (BANNER_RE.test(lower) && qte == null && !num) continue;
     if (num && !isCode(num) && qte == null) continue;       // bannières de page (« CONSTRUCTION D'UNE… », « RECAPITULATIF »…)
@@ -194,22 +225,42 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
     const kw = !num ? desRaw.match(CHAPTER_KW_RE) : null;
     const isRomanOrLetter = !!num && qte == null && !unite && (ROMAN_RE.test(num) || /^[A-Z]$/.test(num));
     const isIntChapter = !!num && qte == null && !unite && INT_RE.test(num) && hasChildren(num);
-    if (isRomanOrLetter || isIntChapter || (kw && qte == null)) {
+    // Bordereau à « CHAPITRE n » : I / 1 / 2 / III « 1 - EQUIPEMENTS »… = sous-parties (zone), pas des chapitres.
+    // Un « A » / « 2 » suivi d'un texte libre (« Pose et raccordement : ») reste un article numéroté.
+    const secLike = !!num && qte == null && !unite && (ROMAN_RE.test(num) || /^[A-Z]$/.test(num) || INT_RE.test(num));
+    if (hasTop && secLike && (new RegExp("^" + esc(num) + "\\s*(?:[-–):]|\\.(?!\\d))\\s*\\S").test(desRaw) || /^chapitre\b/i.test(desRaw))) {
+      flush();
+      zone = stripCode(desRaw, num).replace(/^chapitre\s+\S+\s*[:\-–.)]*\s*/i, "").trim();
+      continue;
+    }
+    if ((!hasTop && (isRomanOrLetter || isIntChapter)) || (kw && qte == null)) {
       flush();
       const code = num || kw![2].toUpperCase();
       const titre = (num ? stripCode(desRaw, num) : kw![3]).replace(/\s+/g, " ").trim();
       chap = { code, titre, lignes: [] }; chapitres.push(chap); zone = ""; prevUnit = "";
+      // chapitre « 2 » + titre sur la 1re ligne et description des travaux sur les suivantes
+      const lines = String(row[map.des] ?? "").split(/\r?\n/).map(clean).filter(Boolean);
+      intro = ""; chapInt = isIntChapter;
+      if (isIntChapter && lines.length > 1) { chap.titre = stripCode(lines[0], num); intro = clean(lines.join(" ")); }
       continue;
     }
 
     // ---- 3. Nouvel article (code 1.1, 1.4.1, A.2…) ----
     if (num && isCode(num)) {
+      if (!hasTop && chapInt && INT_RE.test(num) && !hasChildren(num)) {
+        // « 4 », « 5 »… sans sous-articles, entre deux chapitres numériques : article autonome = son propre chapitre
+        flush(); intro = "";
+        const t = stripCode(des, num);
+        chap = { code: num, titre: t.length > 100 ? t.slice(0, 97).trimEnd() + "…" : t, lignes: [] }; chapitres.push(chap); zone = ""; prevUnit = "";
+      }
       const prev = art;
-      const nested = !!prev && prev.emitted === 0 && !prev.unit && !prev.comp && num.startsWith(prev.num + ".");
+      // « 1.2 VENTILATION ATEX » puis « A ventilateur… » : la variante A hérite du titre de 1.2 (et garde son n°)
+      const letter = /^[A-Z]$/.test(num) && !!prev && !/^[A-Z]$/.test(prev.num);
+      const nested = !!prev && prev.emitted === 0 && !prev.unit && !prev.comp && (num.startsWith(prev.num + ".") || letter);
       const inherited = nested ? prev!.parts : [];
       if (!nested) flush(); else art = null;
       const title = stripCode(des, num);
-      art = { num, parts: [...inherited, ...(title ? [title] : [])], label: "", emitted: 0, unit: "", compUnit: "", comp: false, zone };
+      art = { num: nested && letter ? prev!.num : num, parts: [...inherited, ...(title ? [title] : [])], label: "", emitted: 0, unit: "", compUnit: "", comp: false, zone, pend: null };
       if (qte != null) emit(art, "", unite, qte);
       else if (unite && !COMPONENT_RE.test(lower)) art.unit = unite;
       continue;
@@ -221,7 +272,9 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
     // « Fourniture » / « Pose » : composantes de prix de l'article, pas des lignes
     if (COMPONENT_RE.test(lower)) {
       if (art) { art.comp = true; if (unite) art.compUnit = unite; }
-      if (qte != null && art && art.emitted === 0) emit(art, "", unite, qte);
+      // « Fourniture : U 1 », « Pose : U 1 » portent la même quantité que la ligne de total qui suit (« L'unité : U 1 ») :
+      // on la met de côté, et on ne l'émet que si aucune ligne de total ne vient (évite les doublons)
+      if (qte != null && art && art.emitted === 0 && !art.pend) art.pend = { qty: qte, unit: unite };
       continue;
     }
 
@@ -243,7 +296,13 @@ export function parseBordereau(rows: Row[]): ParsedChapitre[] {
     if (LABEL_RE.test(des)) { art.label = des; continue; }   // variante « a) … »
     if (art.emitted > 0) {
       const upper = des === des.toUpperCase() && /[A-Z]{3}/.test(des) && des.length <= 60;
-      if (upper) { flush(); zone = des; continue; }          // nouveau sous-titre en MAJUSCULES
+      if (upper) {
+        // intitulé de bloc répété dans le même article (« CARACTERISTIQUES TECHNIQUES CTA 6 » après « … CTA 5 ») = nouvelle variante
+        const key = norm(des).split(" ").slice(0, 2).join(" ");
+        const at = art.parts.findIndex((p) => norm(p).startsWith(key));
+        if (at > 0) { art.parts = [...art.parts.slice(0, at), des]; continue; }
+        flush(); zone = des; continue;                       // nouveau sous-titre en MAJUSCULES
+      }
       art.label = join([art.label, des]);                    // précision de variante sans « a) » (ex. « 250 x 250 »)
     } else art.parts.push(des);
   }
