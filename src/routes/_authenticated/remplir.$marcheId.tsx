@@ -19,7 +19,7 @@ import { matchLignes } from "@/lib/match.functions";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/_authenticated/remplir/marcheId")({
+export const Route = createFileRoute("/_authenticated/remplir/$marcheId")({
   head: () => ({ meta: [{ title: "Remplir — AeroNova BID" }, { name: "description", content: "Poste de revue des suggestions de prix ligne par ligne." }, { property: "og:title", content: "Remplir — AeroNova BID" }, { property: "og:description", content: "Poste de revue des suggestions de prix ligne par ligne." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }),
   component: Remplir,
 });
@@ -190,30 +190,67 @@ function Remplir() {
       } catch (e: any) { toast.error(e.message, { id: t }); } finally { setMatching(false); }
       return;
     }
-    // Full marché: one chapter at a time, so a huge bordereau can never blow a single
-    // request's CPU budget — and the person sees each chapter complete as it finishes
-    // instead of staring at a blank spinner until the entire thing is done.
-    const orphanIds = allLignes.filter((l) => !chapitres.some((c: any) => c.id === l.chapitre_id) && l.statut !== "verifie").map((l) => l.id);
-    const scopes = [...chapitres.map((c: any) => ({ id: c.id, code: c.code, titre: c.titre })), ...(orphanIds.length ? [{ id: null, code: "—", titre: "Hors chapitre" }] : [])];
-    setChapProgress(scopes.map((s) => ({ ...s, status: "pending" as const })));
-    let done = 0, failures = 0;
-    for (const s of scopes) {
-      const hasWork = s.id === null || allLignes.some((l) => l.chapitre_id === s.id && l.statut !== "verifie");
-      if (!hasWork) { setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "done" } : x))); continue; }
-      setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "loading" } : x)));
-      try {
-        const r = await runChunked(s.id ? { chapitreId: s.id } : { ligneIds: orphanIds });
-        done += r.done; failures += r.failures;
-        setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "done" } : x)));
-      } catch (e: any) {
-        toast.error(`${s.code} : ${e.message}`);
-        setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "error" } : x)));
+    // Full marché — always resumable, single button:
+    //  • some lines still "non_rempli" → only those are processed (resume where the last run stopped);
+    //  • none left (everything filled) → a fresh pass over every non-verified line starts from the top.
+    // Progress lives in the DB (a processed line leaves "non_rempli"), so it survives a failure, a reload or another device.
+    // For a fresh pass, lines are first put back to "non_rempli" (their current suggestion is kept until overwritten),
+    // so an interruption mid-pass also resumes from the first line not yet redone.
+    try {
+      await qc.refetchQueries({ queryKey: key });
+      const fresh: any = qc.getQueryData(key);
+      const lignesNow: any[] = [...(fresh?.marche_lignes ?? [])].sort((a, b) => a.ordre - b.ordre);
+      const todo = lignesNow.filter((l) => l.statut !== "verifie");
+      if (!todo.length) { toast.info("Toutes les lignes sont déjà vérifiées"); return; }
+      const unfilled = todo.filter((l) => l.statut === "non_rempli");
+      let queue = unfilled;
+      if (!unfilled.length) {
+        const { error } = await supabase.from("marche_lignes").update({ statut: "non_rempli" }).eq("marche_id", marcheId).neq("statut", "verifie");
+        if (error) throw error;
+        qc.invalidateQueries({ queryKey: key });
+        queue = todo;
+        toast.info(`Tout est rempli : nouvelle passe sur ${todo.length} lignes`);
+      } else if (unfilled.length < todo.length) {
+        toast.info(`Reprise : ${unfilled.length} ligne${unfilled.length > 1 ? "s" : ""} restante${unfilled.length > 1 ? "s" : ""} sur ${todo.length}`);
       }
+
+      const byChap = new Map<string | null, string[]>();
+      for (const l of queue) {
+        const k = chapitres.some((c: any) => c.id === l.chapitre_id) ? l.chapitre_id : null;
+        byChap.set(k, [...(byChap.get(k) ?? []), l.id]);
+      }
+      const scopes = [
+        ...chapitres.filter((c: any) => byChap.has(c.id)).map((c: any) => ({ id: c.id as string | null, code: c.code, titre: c.titre })),
+        ...(byChap.has(null) ? [{ id: null as string | null, code: "—", titre: "Hors chapitre" }] : []),
+      ];
+      setChapProgress(scopes.map((s) => ({ ...s, status: "pending" as const })));
+      let done = 0, failures = 0;
+      for (const s of scopes) {
+        setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "loading" } : x)));
+        try {
+          const ids = byChap.get(s.id)!;
+          // Explicit id windows (not a chapter-wide query) keep every request small and the list stable while statuses change.
+          for (let i = 0; i < ids.length; i += 30) {
+            const r = await runChunked({ ligneIds: ids.slice(i, i + 30) });
+            done += r.done; failures += r.failures;
+          }
+          setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "done" } : x)));
+        } catch (e: any) {
+          setChapProgress((p) => p!.map((x) => (x.id === s.id ? { ...x, status: "error" } : x)));
+          toast.error(`${s.code} : ${e.message} — ${done} lignes faites. Relancez pour reprendre là où ça s'est arrêté.`);
+          await logActivity(supabase, user.id, "match_ia_marche_interrompu", "marches", marcheId, { done, failures });
+          setTimeout(() => setChapProgress(null), 2500);
+          return;
+        }
+      }
+      toast.success(`${done} lignes analysées${failures ? ` · ${failures} replis déterministes` : ""}`);
+      await logActivity(supabase, user.id, "match_ia_marche", "marches", marcheId, { done, failures });
+      setTimeout(() => setChapProgress(null), 1200);
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setMatching(false);
     }
-    toast.success(`${done} lignes analysées${failures ? ` · ${failures} replis déterministes` : ""}`);
-    await logActivity(supabase, user.id, "match_ia_marche", "marches", marcheId, { done, failures });
-    setTimeout(() => setChapProgress(null), 1200);
-    setMatching(false);
   }
 
   async function addArticle() {
